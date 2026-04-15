@@ -1,0 +1,494 @@
+import { useState, useCallback, useEffect } from "react";
+import { supabase } from "./supabase";
+
+const API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY;
+const PROXY = "http://localhost:3001/rss";
+const FLAG = { dk: "🇩🇰", se: "🇸🇪", no: "🇳🇴" };
+
+
+
+async function searchGoogleNews(query, country, fromDate, toDate) {
+  const lang = { dk: "da", se: "sv", no: "no" }[country];
+  const geoWord = { dk: "Danmark", se: "Sverige", no: "Norge" }[country] || "";
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query + " " + geoWord)}&hl=${lang}&gl=${country}&ceid=${country.toUpperCase()}:${lang}&num=100`;
+  const res = await fetch(`${PROXY}?url=${encodeURIComponent(url)}`);
+  const text = await res.text();
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, "application/xml");
+  const from = fromDate ? new Date(fromDate) : null;
+  const to = toDate ? new Date(toDate + "T23:59:59") : null;
+  return [...xml.querySelectorAll("item")].map(item => {
+    const get = tag => item.querySelector(tag)?.textContent?.trim() || "";
+    return {
+      external_id: get("guid") || get("link"),
+      title: get("title").replace(/\s*-\s*[^-]+$/, ""),
+      snippet: get("description").replace(/<[^>]+>/g, "").slice(0, 200),
+      url: get("link"),
+      date: get("pubDate") || new Date().toISOString(),
+      source: item.querySelector("source")?.textContent?.trim() || "Google News",
+      country,
+      journalist: null,
+      score: null,
+      client: null,
+    };
+  }).filter(a => {
+    const d = new Date(a.date);
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    return true;
+  });
+}
+async function searchByMediaList(query, fromDate, toDate) {
+  const results = [];
+  for (const source of sourcesRSS) {
+    try {
+      const domain = source.url ? new URL(source.url).hostname.replace('www.', '') : null;
+      if (!domain) continue;
+      const lang = { dk: "da", se: "sv", no: "no" }[source.country] || "da";
+      const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query + " site:" + domain)}&hl=${lang}&gl=${source.country}&ceid=${source.country.toUpperCase()}:${lang}`;
+      const res = await fetch(`${PROXY}?url=${encodeURIComponent(url)}`);
+      const text = await res.text();
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(text, "application/xml");
+      const from = fromDate ? new Date(fromDate) : null;
+      const to = toDate ? new Date(toDate + "T23:59:59") : null;
+      const items = [...xml.querySelectorAll("item")].map(item => {
+        const get = tag => item.querySelector(tag)?.textContent?.trim() || "";
+        return {
+          external_id: get("guid") || get("link"),
+          title: get("title").replace(/\s*-\s*[^-]+$/, ""),
+          snippet: get("description").replace(/<[^>]+>/g, "").slice(0, 200),
+          url: get("link"),
+          date: get("pubDate") || new Date().toISOString(),
+          source: source.name,
+          country: source.country,
+          journalist: null,
+          score: null,
+          client: null,
+        };
+      }).filter(a => {
+        const d = new Date(a.date);
+        if (from && d < from) return false;
+        if (to && d > to) return false;
+        return true;
+      });
+      results.push(...items);
+    } catch (e) { /* skip */ }
+  }
+  return results;
+}
+
+async function fetchRSS(source) {
+  const res = await fetch(`${PROXY}?url=${encodeURIComponent(source.url)}`);
+  const text = await res.text();
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, "application/xml");
+  return [...xml.querySelectorAll("item")].slice(0, 10).map(item => {
+    const get = tag => item.querySelector(tag)?.textContent?.trim() || "";
+    const authorEl = item.querySelector("author") || item.querySelector("dc\\:creator") || item.querySelector("creator");
+    return {
+      external_id: get("guid") || get("link"),
+      title: get("title"),
+      snippet: get("description").replace(/<[^>]+>/g, "").slice(0, 200),
+      url: get("link"),
+      date: get("pubDate") || new Date().toISOString(),
+      source: source.name,
+      country: source.country,
+      journalist: authorEl?.textContent?.trim() || null,
+      score: null,
+      client: null,
+    };
+  });
+}
+
+async function scoreArticle(article, searchQuery, clients) {
+  const context = searchQuery
+    ? `Brugeren søgte på: "${searchQuery}". Vurdér om artiklen handler primært om dette emne. Vær streng – løse omtaler scorer lavt.`
+    : clients.length > 0
+    ? `Vurdér om artiklen er relevant for disse klienter:\n${clients.map(c => `- ${c.name}: ${c.keywords.join(", ")}`).join("\n")}`
+    : `Vurdér om artiklen er nyhedsrelevant for et dansk PR-bureau.`;
+
+  const clientName = searchQuery || (clients.length > 0 ? clients[0].name : "Generel");
+
+  const prompt = `Du er medieovervågningsassistent for et dansk PR-bureau. ${context}
+
+Artikel:
+Titel: ${article.title}
+Tekst: ${article.snippet}
+Kilde: ${article.source}
+
+Regler:
+- Score 5: Artiklen handler primært om emnet
+- Score 4: Emnet er centralt i artiklen
+- Score 3: Emnet nævnes i relevant kontekst
+- Score 2: Løs eller perifer omtale
+- Score 1: Ikke relevant
+
+Svar KUN med JSON: {"client":"${clientName}","score":3}`;
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": API_KEY,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 60,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data = await res.json();
+    const text = data.content?.[0]?.text || "{}";
+    const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+    return { score: parsed.score || 1, client: parsed.client || clientName };
+  } catch {
+    return { score: 1, client: clientName };
+  }
+}
+
+async function saveArticle(article) {
+  await supabase.from("articles").upsert({
+    external_id: article.external_id,
+    title: article.title,
+    snippet: article.snippet,
+    url: article.url,
+    source: article.source,
+    country: article.country,
+    date: article.date,
+    score: article.score,
+    journalist: article.journalist,
+  }, { onConflict: "external_id" });
+}
+
+function Chip({ active, onClick, children }) {
+  return <button onClick={onClick} style={{ padding: "4px 11px", borderRadius: 16, border: `1px solid ${active ? "#0f172a" : "#e2e8f0"}`, background: active ? "#0f172a" : "transparent", color: active ? "#fff" : "#64748b", fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>{children}</button>;
+}
+
+function Badge({ color = "gray", children }) {
+  const t = { gray: ["#f1f5f9","#475569","#e2e8f0"], green: ["#f0fdf4","#16a34a","#bbf7d0"], amber: ["#fffbeb","#d97706","#fde68a"], blue: ["#eff6ff","#1d4ed8","#bfdbfe"], teal: ["#f0fdfa","#0f766e","#99f6e4"] }[color] || ["#f1f5f9","#475569","#e2e8f0"];
+  return <span style={{ fontSize: 11, background: t[0], color: t[1], border: `1px solid ${t[2]}`, padding: "2px 8px", borderRadius: 10, fontWeight: 500, whiteSpace: "nowrap" }}>{children}</span>;
+}
+
+function Dots({ score }) {
+  const c = score >= 4 ? "#16a34a" : score === 3 ? "#d97706" : "#94a3b8";
+  return <div style={{ display: "flex", gap: 3 }}>{[1,2,3,4,5].map(i => <div key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: i <= score ? c : "#e2e8f0" }} />)}</div>;
+}
+
+function ArticleCard({ a }) {
+  const [open, setOpen] = useState(false);
+  const sc = a.score >= 4 ? "#16a34a" : a.score === 3 ? "#d97706" : "#e2e8f0";
+  return (
+    <div onClick={() => setOpen(!open)} style={{ background: "#fff", border: "1px solid #e8edf3", borderLeft: `3px solid ${sc}`, borderRadius: 10, padding: "13px 16px", marginBottom: 8, cursor: "pointer" }}
+      onMouseEnter={e => e.currentTarget.style.boxShadow = "0 2px 10px rgba(0,0,0,0.06)"}
+      onMouseLeave={e => e.currentTarget.style.boxShadow = "none"}>
+      <div style={{ display: "flex", gap: 7, alignItems: "center", marginBottom: 5, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12, color: "#64748b", fontWeight: 500 }}>{FLAG[a.country]} {a.source}</span>
+        {a.score && <Badge color={a.score >= 4 ? "green" : a.score === 3 ? "amber" : "gray"}>score {a.score}</Badge>}
+        {a.client && <Badge color="teal">{a.client}</Badge>}
+        <span style={{ marginLeft: "auto", fontSize: 11, color: "#94a3b8" }}>{new Date(a.date).toLocaleDateString("da-DK", { day: "numeric", month: "short" })}</span>
+      </div>
+      <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a", lineHeight: 1.4, marginBottom: 7 }}>{a.title}</div>
+      {open && <div style={{ fontSize: 13, color: "#475569", lineHeight: 1.65, marginBottom: 8, paddingTop: 8, borderTop: "1px solid #f1f5f9" }}>{a.snippet}</div>}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        {a.journalist ? <Badge>{a.journalist}</Badge> : <span style={{ fontSize: 11, color: "#94a3b8", fontStyle: "italic" }}>journalist ukendt</span>}
+        {a.score && <Dots score={a.score} />}
+        <a href={a.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} style={{ marginLeft: "auto", fontSize: 11, color: "#1d4ed8", textDecoration: "none" }}>→ artikel</a>
+      </div>
+    </div>
+  );
+}
+
+function SourceManager({ sources, onAdd, onDelete }) {
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [country, setCountry] = useState("dk");
+  const [filter, setFilter] = useState("all");
+  const filtered = filter === "all" ? sources : sources.filter(s => s.country === filter);
+  return (
+    <div style={{ background: "#fff", border: "1px solid #e8edf3", borderRadius: 12, padding: 20, marginBottom: 16 }}>
+      <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a", marginBottom: 14 }}>Medier ({sources.length})</div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        {[["all","Alle"],["dk","🇩🇰 DK"],["se","🇸🇪 SE"],["no","🇳🇴 NO"]].map(([v,l]) => (
+          <button key={v} onClick={() => setFilter(v)} style={{ padding: "3px 10px", borderRadius: 12, border: "1px solid", borderColor: filter===v ? "#0f172a" : "#e2e8f0", background: filter===v ? "#0f172a" : "transparent", color: filter===v ? "#fff" : "#64748b", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>{l}</button>
+        ))}
+      </div>
+      <div style={{ maxHeight: 320, overflowY: "auto", marginBottom: 14 }}>
+        {filtered.map(s => (
+          <div key={s.id} style={{ display: "flex", gap: 8, alignItems: "center", padding: "7px 0", borderBottom: "1px solid #f1f5f9" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 500, fontSize: 13, color: "#0f172a" }}>{s.name}</div>
+              <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 1 }}>{s.url}</div>
+            </div>
+            <span style={{ fontSize: 10, background: "#f1f5f9", color: "#475569", padding: "2px 6px", borderRadius: 8 }}>{s.country.toUpperCase()}</span>
+            <button onClick={() => onDelete(s.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "#94a3b8", padding: "0 4px" }}>×</button>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingTop: 14, borderTop: "1px solid #f1f5f9" }}>
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="Medienavn" style={{ flex: 1, minWidth: 120, padding: "6px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, fontFamily: "inherit" }} />
+        <input value={url} onChange={e => setUrl(e.target.value)} placeholder="www.medie.dk" style={{ flex: 2, minWidth: 160, padding: "6px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, fontFamily: "inherit" }} />
+        <select value={country} onChange={e => setCountry(e.target.value)} style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, fontFamily: "inherit", background: "#fff" }}>
+          <option value="dk">🇩🇰 DK</option>
+          <option value="se">🇸🇪 SE</option>
+          <option value="no">🇳🇴 NO</option>
+        </select>
+        <button onClick={() => {
+          if (name.trim() && url.trim()) {
+            const cleanUrl = url.trim().startsWith("http") ? url.trim() : "https://www." + url.trim().replace(/^www\./, "");
+            onAdd(name.trim(), cleanUrl, country);
+            setName(""); setUrl(""); setCountry("dk");
+          }
+        }} style={{ padding: "6px 16px", borderRadius: 8, border: "none", background: "#0f172a", color: "#fff", fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>
+          Tilføj
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ClientManager({ clients, onAdd, onDelete }) {
+  const [name, setName] = useState("");
+  const [keywords, setKeywords] = useState("");
+  return (
+    <div style={{ background: "#fff", border: "1px solid #e8edf3", borderRadius: 12, padding: 20, marginBottom: 16 }}>
+      <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a", marginBottom: 14 }}>Klienter</div>
+      {clients.map(c => (
+        <div key={c.id} style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 0", borderBottom: "1px solid #f1f5f9" }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 500, fontSize: 13, color: "#0f172a" }}>{c.name}</div>
+            <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 2 }}>{c.keywords.join(", ")}</div>
+          </div>
+          <button onClick={() => onDelete(c.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "#94a3b8", padding: "0 4px" }}>×</button>
+        </div>
+      ))}
+      <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="Klientnavn" style={{ flex: 1, minWidth: 120, padding: "6px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, fontFamily: "inherit" }} />
+        <input value={keywords} onChange={e => setKeywords(e.target.value)} placeholder="Nøgleord (kommasepareret)" style={{ flex: 2, minWidth: 180, padding: "6px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, fontFamily: "inherit" }} />
+        <button onClick={() => {
+          if (name.trim()) {
+            onAdd(name.trim(), keywords.split(",").map(k => k.trim()).filter(Boolean));
+            setName(""); setKeywords("");
+          }
+        }} style={{ padding: "6px 16px", borderRadius: 8, border: "none", background: "#0f172a", color: "#fff", fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}>
+          Tilføj
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [sourcesRSS, setSourcesRSS] = useState([]);
+
+  useEffect(() => {
+    supabase.from("sources")
+      .select("name, country, rss_url")
+      .not("rss_url", "is", null)
+      .eq("active", true)
+      .then(({ data }) => setSourcesRSS((data || []).map(s => ({ name: s.name, country: s.country, url: s.rss_url }))));
+  }, []);
+  const [articles, setArticles] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [sources, setSources] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [scoring, setScoring] = useState(false);
+  const [progress, setProgress] = useState("");
+  const [country, setCountry] = useState("all");
+  const [minScore, setMinScore] = useState(1);
+  const [tab, setTab] = useState("feed");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeSearch, setActiveSearch] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+
+  useEffect(() => {
+    loadClients();
+    loadSources();
+  }, []);
+
+  async function loadClients() {
+    const { data } = await supabase.from("clients").select("*").eq("active", true).order("name");
+    if (data) setClients(data);
+  }
+
+  async function loadSources() {
+    const { data } = await supabase.from("sources").select("*").eq("active", true).order("name");
+    if (data) setSources(data);
+  }
+
+  async function addClient(name, keywords) {
+    await supabase.from("clients").insert({ name, keywords });
+    loadClients();
+  }
+
+  async function deleteClient(id) {
+    await supabase.from("clients").delete().eq("id", id);
+    loadClients();
+  }
+
+  async function addSource(name, url, country) {
+    await supabase.from("sources").insert({ name, url, country });
+    loadSources();
+  }
+
+  async function deleteSource(id) {
+    await supabase.from("sources").delete().eq("id", id);
+    loadSources();
+  }
+
+  const runScoring = async (items, query) => {
+    setScoring(true);
+    const scored = [...items];
+    for (let i = 0; i < scored.length; i++) {
+      setProgress(`Scorer ${i + 1} af ${scored.length}...`);
+      const result = await scoreArticle(scored[i], query, query ? [] : clients);
+      scored[i] = { ...scored[i], ...result };
+      setArticles(prev => {
+        const map = new Map(prev.map(a => [a.external_id, a]));
+        map.set(scored[i].external_id, scored[i]);
+        return [...map.values()];
+      });
+      if (scored[i].score >= 3) await saveArticle(scored[i]);
+    }
+    setScoring(false);
+    setProgress("");
+  };
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    setActiveSearch("");
+    setArticles([]);
+    const all = [];
+    for (const source of sourcesRSS) {
+      try {
+        setProgress(`Henter ${source.name}...`);
+        const items = await fetchRSS(source);
+        all.push(...items);
+      } catch (e) { console.warn(e); }
+    }
+    setLoading(false);
+    setArticles(all);
+    await runScoring(all, "");
+  }, [clients]);
+
+  const searchNews = useCallback(async () => {
+    if (!searchQuery.trim()) return;
+    setLoading(true);
+    setActiveSearch(searchQuery);
+    setArticles([]);
+    const all = [];
+    for (const c of ["dk", "se", "no"]) {
+      try {
+        setProgress(`Søger i ${c.toUpperCase()}...`);
+        try {
+  setProgress(`Søger i mediebasen...`);
+  const items = await searchByMediaList(searchQuery, fromDate, toDate);
+  all.push(...items);
+} catch (e) { console.warn(e); }
+    setLoading(false);
+    setArticles(all);
+    await runScoring(all, searchQuery);
+  }, [searchQuery, clients, fromDate, toDate]);
+
+  const filtered = articles.filter(a =>
+    (country === "all" || a.country === country) &&
+    (a.score === null || a.score >= minScore)
+  );
+
+  const relevantCount = articles.filter(a => a.score >= 3).length;
+
+  return (
+    <div style={{ fontFamily: "'DM Sans','Segoe UI',system-ui,sans-serif", background: "#f6f8fb", minHeight: "100vh", paddingBottom: 60 }}>
+      <div style={{ background: "#fff", borderBottom: "1px solid #e8edf3", padding: "13px 24px", display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 15, color: "#0f172a", letterSpacing: "-0.3px", whiteSpace: "nowrap" }}>
+          kudos <span style={{ color: "#94a3b8", fontWeight: 400 }}>/ mediemonitor</span>
+        </div>
+        <div style={{ flex: 1, display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <input type="text" placeholder="Søg på emne, klient eller navn..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} onKeyDown={e => e.key === "Enter" && searchNews()}
+            style={{ flex: 2, minWidth: 180, padding: "7px 14px", borderRadius: 20, border: "1px solid #e2e8f0", fontSize: 13, fontFamily: "inherit", outline: "none" }} />
+          <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+            style={{ padding: "7px 10px", borderRadius: 20, border: "1px solid #e2e8f0", fontSize: 12, fontFamily: "inherit" }} />
+          <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+            style={{ padding: "7px 10px", borderRadius: 20, border: "1px solid #e2e8f0", fontSize: 12, fontFamily: "inherit" }} />
+          <button onClick={searchNews} disabled={loading || scoring || !searchQuery.trim()} style={{ padding: "7px 16px", borderRadius: 20, border: "none", background: loading || scoring ? "#f1f5f9" : "#0f172a", color: loading || scoring ? "#94a3b8" : "#fff", fontSize: 12, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+            {loading ? "Henter..." : scoring ? "Scorer..." : "Søg"}
+          </button>
+          <button onClick={fetchAll} disabled={loading || scoring} style={{ padding: "7px 16px", borderRadius: 20, border: "1px solid #e2e8f0", background: "transparent", color: "#64748b", fontSize: 12, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+            Opdater feed
+          </button>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {[
+            { id: "feed", label: `Artikler (${filtered.length})` },
+            { id: "klienter", label: `Klienter (${clients.length})` },
+            { id: "medier", label: `Medier (${sources.length})` },
+          ].map(t => (
+            <Chip key={t.id} active={tab === t.id} onClick={() => setTab(t.id)}>{t.label}</Chip>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 780, margin: "0 auto", padding: "0 20px" }}>
+        {(loading || scoring) && (
+          <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10, padding: "10px 16px", marginBottom: 14, fontSize: 13, color: "#1d4ed8", display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 14, height: 14, border: "2px solid #bfdbfe", borderTop: "2px solid #1d4ed8", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            {progress}
+          </div>
+        )}
+
+        {activeSearch && (
+          <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 10, padding: "9px 16px", marginBottom: 14, fontSize: 12, color: "#16a34a" }}>
+            Resultater for <strong>"{activeSearch}"</strong>{fromDate && ` fra ${new Date(fromDate).toLocaleDateString("da-DK")}`}{toDate && ` til ${new Date(toDate).toLocaleDateString("da-DK")}`} — {articles.length} artikler, {relevantCount} relevante
+          </div>
+        )}
+
+        {tab === "klienter" && <ClientManager clients={clients} onAdd={addClient} onDelete={deleteClient} />}
+        {tab === "medier" && <SourceManager sources={sources} onAdd={addSource} onDelete={deleteSource} />}
+
+        {tab === "feed" && (
+          <>
+            {articles.length === 0 && !loading && (
+              <div style={{ textAlign: "center", padding: "60px 20px", color: "#94a3b8" }}>
+                <div style={{ fontSize: 32, marginBottom: 12 }}>📡</div>
+                <div style={{ fontSize: 15, fontWeight: 500, color: "#475569", marginBottom: 6 }}>Søg på et emne eller hent live feed</div>
+                <div style={{ fontSize: 13 }}>Sæt evt. et datointerval for at søge i en bestemt periode</div>
+              </div>
+            )}
+            {articles.length > 0 && (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 10, marginBottom: 14 }}>
+                  {[
+                    { v: articles.length, l: "artikler" },
+                    { v: relevantCount, l: "relevante (3+)" },
+                    { v: articles.filter(a => a.score >= 4).length, l: "høj relevans" },
+                    { v: articles.filter(a => a.score === 5).length, l: "score 5" },
+                  ].map(s => (
+                    <div key={s.l} style={{ background: "#fff", border: "1px solid #e8edf3", borderRadius: 10, padding: "12px 14px" }}>
+                      <div style={{ fontSize: 24, fontWeight: 700, color: "#0f172a", lineHeight: 1 }}>{s.v}</div>
+                      <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 3 }}>{s.l}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ background: "#fff", border: "1px solid #e8edf3", borderRadius: 10, padding: "10px 16px", marginBottom: 14, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <span style={{ fontSize: 10, color: "#94a3b8", fontWeight: 600, letterSpacing: "0.06em" }}>LAND</span>
+                  {[["all","Alle"],["dk","🇩🇰"],["se","🇸🇪"],["no","🇳🇴"]].map(([v,l]) => <Chip key={v} active={country===v} onClick={()=>setCountry(v)}>{l}</Chip>)}
+                  <div style={{ width: 1, height: 18, background: "#e8edf3" }} />
+                  <span style={{ fontSize: 10, color: "#94a3b8", fontWeight: 600, letterSpacing: "0.06em" }}>MIN SCORE</span>
+                  {[[1,"Alle"],[3,"3+"],[4,"4+"],[5,"5"]].map(([v,l]) => <Chip key={v} active={minScore===v} onClick={()=>setMinScore(v)}>{l}</Chip>)}
+                </div>
+                {filtered.sort((a,b) => (b.score||0)-(a.score||0)).map((a, i) => <ArticleCard key={a.external_id || i} a={a} />)}
+              </>
+            )}
+          </>
+        )}
+
+        <div style={{ textAlign: "center", fontSize: 11, color: "#cbd5e1", marginTop: 24 }}>Live data · Claude Haiku · Supabase</div>
+      </div>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
