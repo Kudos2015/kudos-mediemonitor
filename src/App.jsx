@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import Nav from "./Nav";
 import { supabase } from "./supabase";
 
-const PROXY = "http://localhost:3001/rss";
+const PROXY = import.meta.env.DEV ? "http://localhost:3001/rss" : "/api/rss";
 
 async function searchMediaList(query, sources, fromDate, toDate) {
   const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
