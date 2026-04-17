@@ -7,16 +7,16 @@ const PROXY = import.meta.env.DEV ? "http://localhost:3001/rss" : "/api/rss";
 async function searchMediaList(query, sources, fromDate, toDate) {
   const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
   const sourcesWithRSS = sources.filter(s => s.rss_url);
-  const results = [];
   const from = fromDate ? new Date(fromDate) : null;
   const to = toDate ? new Date(toDate + "T23:59:59") : null;
 
-  for (const source of sourcesWithRSS) {
+  async function fetchSource(source) {
     try {
       const res = await fetch(`${PROXY}?url=${encodeURIComponent(source.rss_url)}`);
-      if (!res.ok) continue;
+      if (!res.ok) return [];
       const text = await res.text();
       const xml = new DOMParser().parseFromString(text, "application/xml");
+      const items = [];
       [...xml.querySelectorAll("item")].forEach(item => {
         const get = tag => item.querySelector(tag)?.textContent?.trim() || "";
         const title = get("title");
@@ -26,7 +26,7 @@ async function searchMediaList(query, sources, fromDate, toDate) {
         const d = new Date(get("pubDate"));
         if (from && d < from) return;
         if (to && d > to) return;
-        results.push({
+        items.push({
           external_id: get("guid") || get("link"),
           title,
           snippet,
@@ -36,7 +36,16 @@ async function searchMediaList(query, sources, fromDate, toDate) {
           country: source.country || "dk",
         });
       });
-    } catch (e) { /* skip */ }
+      return items;
+    } catch (e) { return []; }
+  }
+
+  // Fetch all sources in parallel, in batches of 10
+  const results = [];
+  for (let i = 0; i < sourcesWithRSS.length; i += 10) {
+    const batch = sourcesWithRSS.slice(i, i + 10);
+    const batchResults = await Promise.all(batch.map(fetchSource));
+    batchResults.forEach(items => results.push(...items));
   }
 
   const seen = new Set();
