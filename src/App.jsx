@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import AuthGuard from "./AuthGuard";
 import Nav from "./Nav";
 import { supabase } from "./supabase";
 
@@ -85,6 +86,7 @@ function ArticleCard({ a }) {
         </div>
       </div>
     </div>
+    </AuthGuard>
   );
 }
 
@@ -175,6 +177,7 @@ export default function App() {
   const COUNTRIES = [{ code: "dk", label: "🇩🇰 DK" }, { code: "se", label: "🇸🇪 SE" }, { code: "no", label: "🇳🇴 NO" }, { code: "all", label: "Alle" }];
 
   return (
+    <AuthGuard>
     <div style={{ fontFamily: "'DM Sans','Segoe UI',system-ui,sans-serif", background: "#f6f8fb", minHeight: "100vh", paddingBottom: 60, paddingTop: 40 }}>
       <Nav active="mediemonitor" />
       <div style={{ background: "#fff", borderBottom: "1px solid #e8edf3", padding: "13px 24px", display: "flex", alignItems: "center", gap: 16 }}>
